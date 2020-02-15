@@ -2,6 +2,7 @@ import json
 import os
 import os.path as path
 from typing import Dict, Iterable, Optional, Set, Union
+from options import truepath
 
 
 class File:
@@ -76,6 +77,19 @@ class Metadata:
     def __init__(self):
         self.__base = Directory("/")
 
+    def __getitem__(self, item: str) -> Union[Directory, File, None]:
+        cur = self.__base
+        components = list(self.__component_iter(item))
+        for component in components[:-1]:
+            if component not in cur.subdirs:
+                return None
+            cur = cur.subdirs[component]
+        if components[-1] in cur.subdirs:
+            return cur.subdirs[components[-1]]
+        elif components[-1] in cur.files:
+            return cur.files[components[-1]]
+        return cur
+
     def __component_iter(self, dir: str) -> Iterable[str]:
         for component in dir[int(dir.startswith("/")):].split("/"):
             if component != "":
@@ -106,7 +120,7 @@ class Metadata:
         if not path.isfile(filename):
             raise Exception(f"Only pass files to add(). {filename} is not.")
 
-        filename = path.abspath(filename)
+        filename = truepath(filename)
         if mtime is None:
             mtime = path.getmtime(filename)
         mtime = int(mtime)
@@ -116,6 +130,9 @@ class Metadata:
 
     def dict(self) -> Dict:
         return {"/": self.__base.dict()}
+
+    def serialize(self):
+        return json.dumps(self.dict())
 
     def __str__(self):
         return json.dumps(self.dict(), sort_keys=True, indent=2)
