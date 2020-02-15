@@ -53,6 +53,7 @@ def gen_filename(full: bool, compression_algo: Compression):
 
     return f"backup{'-full' if full else ''}-{dt.year}-{str(dt.month).zfill(2)}-{str(dt.day).zfill(2)}-{str(dt.hour).zfill(2)}-{str(dt.minute).zfill(2)}-{str(dt.second).zfill(2)}{ext}"
 
+
 def get_prev_meta() -> Optional[Tuple[Metadata, str]]:
     backup_meta_list = list(filter(
         lambda path: os.path.isfile(path) and re.fullmatch(

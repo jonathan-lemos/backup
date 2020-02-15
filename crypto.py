@@ -1,12 +1,14 @@
-from typing import Iterable, List, Optional, Tuple, Union
-from getpass import getpass
 import os
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from enum import Enum
+from getpass import getpass
+from typing import Optional, Union
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 __backend = default_backend()
 
@@ -143,12 +145,20 @@ def decrypt(
                 with open(file_out, "wb") as wf:
                     while len(buf := rf.read(65536)) != 0:
                         wf.write(decryptor.update(buf))
-                    wf.write(decryptor.finalize())
+                    try:
+                        wf.write(decryptor.finalize())
+                    except InvalidTag as e:
+                        raise ValueError(
+                            "The GCM authentication tag was invalid. Most likely the data has been corrupted.") from e
             else:
                 ba = bytearray()
                 while len(buf := rf.read(65536)) != 0:
                     ba.extend(decryptor.update(buf))
-                ba.extend(decryptor.finalize())
+                try:
+                    ba.extend(decryptor.finalize())
+                except InvalidTag as e:
+                    raise ValueError(
+                        "The GCM authentication tag was invalid. Most likely the data has been corrupted.") from e
                 return ba
     else:
         if len(input) < 44:
@@ -170,9 +180,17 @@ def decrypt(
         if file_out:
             with open(file_out, "wb") as wf:
                 wf.write(decryptor.update(remainder))
-                wf.write(decryptor.finalize())
+                try:
+                    wf.write(decryptor.finalize())
+                except InvalidTag as e:
+                    raise ValueError(
+                        "The GCM authentication tag was invalid. Most likely the data has been corrupted.") from e
         else:
             ba = bytearray()
             ba.extend(decryptor.update(remainder))
-            ba.extend(decryptor.finalize())
+            try:
+                ba.extend(decryptor.finalize())
+            except InvalidTag as e:
+                raise ValueError(
+                    "The GCM authentication tag was invalid. Most likely the data has been corrupted.") from e
             return ba
