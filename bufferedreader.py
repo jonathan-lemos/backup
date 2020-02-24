@@ -1,22 +1,25 @@
 from typing import Iterable, Union
 
 
-def combine(*arr: Union[bytes, Iterable[bytes]]) -> bytearray:
-    ret = bytearray()
-    for b in arr:
-        if isinstance(b, bytes):
-            ret.extend(b)
-        else:
-            for ba in b:
-                ret.extend(ba)
-    return ret
+def combine(*arr: Union[bytes, Iterable[bytes]]) -> bytes:
+    def args():
+        for b in arr:
+            if isinstance(b, bytes):
+                yield b
+            else:
+                for ba in b:
+                    yield ba
+    return b"".join(args())
 
 
 class BufferedReader:
-    def __init__(self, arg: Union[Iterable[bytes], str]):
+    def __init__(self, arg: Union[bytes, Iterable[bytes], str]):
         if isinstance(arg, str):
-            self.file = open(self.file, "rb")
+            self.file = open(arg, "rb")
             self.bytestream, self.buf = None, None
+        elif isinstance(arg, bytes):
+            self.file = None
+            self.bytestream, self.buf = iter([arg]), bytearray()
         else:
             self.file = None
             self.bytestream, self.buf = iter(arg), bytearray()
@@ -40,7 +43,7 @@ class BufferedReader:
                 pass
             ret = self.buf[:length]
             self.buf = self.buf[length:]
-            return ret
+            return bytes(ret)
 
     def chunks(self, size: int = 65536) -> Iterable[bytes]:
         while len(buf := self.read(size)) != 0:

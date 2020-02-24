@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.padding import PKCS7
 
 
 class CipherType(Enum):
@@ -50,27 +51,32 @@ class BlockCipherModeType(Enum):
     CBC = {
         "name": "CBC",
         "algorithm": modes.CBC,
-        "auth_tag": None
+        "auth_tag": None,
+        "padded": True
     }
     CTR = {
         "name": "CTR",
         "algorithm": modes.CTR,
-        "auth_tag": None
+        "auth_tag": None,
+        "padded": False
     }
     OFB = {
         "name": "OFB",
         "algorithm": modes.OFB,
-        "auth_tag": None
+        "auth_tag": None,
+        "padded": False
     }
     CFB = {
         "name": "CFB",
         "algorithm": modes.CFB,
-        "auth_tag": None
+        "auth_tag": None,
+        "padded": False
     }
     GCM = {
-        "name": "CBC",
+        "name": "GCM",
         "algorithm": modes.GCM,
-        "auth_tag": 16
+        "auth_tag": 16,
+        "padded": False
     }
 
 
@@ -100,27 +106,40 @@ class HashType(Enum):
     }
 
 
+__backend = default_backend()
 __cipher_dict = {x.name: x.value for x in CipherType}
 __mode_dict = {x.name: x.value for x in BlockCipherModeType}
 
 
-def supported_ciphers() -> Dict[str, Tuple[Dict, int, Optional[Dict]]]:
+def __supported_ciphers() -> Dict[str, Tuple[Dict, int, Optional[Dict]]]:
     ret = {}
     for cipher in __cipher_dict:
         for key_size in __cipher_dict[cipher]["key_sizes"]:
             if __cipher_dict[cipher]["block_cipher"]:
                 for mode in __mode_dict:
-                    ret[f"{cipher}-{key_size}-{mode}"] = (__cipher_dict[cipher], key_size, __mode_dict[mode])
+                    if __backend.cipher_supported(__cipher_dict[cipher]["algorithm"](b"0" * (key_size // 8)), __mode_dict[mode]["algorithm"](b"0" * __cipher_dict[cipher]["block_size"])):
+                        ret[f"{cipher}-{key_size}-{mode}"] = (__cipher_dict[cipher], key_size, __mode_dict[mode])
             else:
-                ret[f"{cipher}-{key_size}"] = (__cipher_dict[cipher], key_size, None)
+                if __backend.cipher_supported(__cipher_dict[cipher]["algorithm"](b"0" * (key_size // 8)), None):
+                    ret[f"{cipher}-{key_size}"] = (__cipher_dict[cipher], key_size, None)
     return ret
 
 
-__ciphers = supported_ciphers()
+__ciphers = __supported_ciphers()
 __kdfs = {x.name: x.value for x in KdfType}
 __hashtypes = {x.name: x.value for x in HashType}
 
-__backend = default_backend()
+
+def cipher_list() -> Iterable[str]:
+    return iter(__ciphers)
+
+
+def kdf_list() -> Iterable[str]:
+    return iter(__kdfs)
+
+
+def hash_list() -> Iterable[str]:
+    return iter(__hashtypes)
 
 
 def __rand_bytes(length: int) -> bytes:
@@ -152,121 +171,169 @@ def __get_meta(cipher: str, kdf: str, hashfunc: str) -> Tuple[Dict, int, Dict, D
     try:
         cipher, key_len, mode = __ciphers[cipher.upper()]
     except KeyError:
-        raise ValueError(f"Invalid cipher '{cipher}'. Must be one of: {', '.join(__ciphers)}")
+        raise ValueError(f"Invalid cipher '{cipher}'. Must be one of: {', '.join(cipher_list())}")
 
     try:
         kdf = __kdfs[kdf.upper()]
     except KeyError:
-        raise ValueError(f"Invalid KDF '{kdf}'. Must be one of: {' '.join(__kdfs)}")
+        raise ValueError(f"Invalid KDF '{kdf}'. Must be one of: {' '.join(kdf_list())}")
 
     try:
         hashfunc = __hashtypes[hashfunc.upper()]
     except KeyError:
-        raise ValueError(f"Invalid hash function '{hashfunc}'. Must be one of {' '.join(__hashtypes)}.")
+        raise ValueError(f"Invalid hash function '{hashfunc}'. Must be one of {' '.join(hash_list())}.")
 
     return cipher, key_len, mode, kdf, hashfunc
 
 
-def encrypt(
+def __encrypt(
         input: Union[str, Iterable[bytes]],
-        output_file: Optional[str],
-        cipher: str = "AES-256-CBC",
+        cipher: str = "AES-256-GCM",
         kdf: str = "PBKDF2",
         hashfunc: str = "SHA3_512",
         salt: Optional[bytes] = None,
         iv: Optional[bytes] = None,
-        iterations: int = 100000
+        iterations: int = 100000,
+        buf_size: int = 65536
+) -> Iterable[bytes]:
+    with BufferedReader(input) as istream:
+
+        cipher, key_len, mode, kdf, hashfunc = __get_meta(cipher, kdf, hashfunc)
+
+        if salt is None:
+            salt = __rand_bytes(16)
+        if iv is None:
+            iv = __rand_bytes(cipher["block_size"])
+        key = __make_key(salt, kdf["algorithm"], hashfunc["algorithm"], key_len, iterations)
+
+        encryptor = Cipher(
+            cipher["algorithm"](key),
+            mode["algorithm"](iv) if mode else None,
+            backend=__backend
+        ).encryptor()
+
+        yield len(salt).to_bytes(2, byteorder="little")
+        yield salt
+        if mode:
+            yield iv
+
+        padder = PKCS7(cipher["block_size"] * 8).padder()
+
+        for buf in istream.chunks(buf_size):
+            if mode["padded"]:
+                yield encryptor.update(padder.update(buf))
+            else:
+                yield encryptor.update(buf)
+
+        if mode["padded"]:
+            yield encryptor.update(padder.finalize())
+        yield encryptor.finalize()
+
+        if mode["auth_tag"]:
+            yield encryptor.tag
+
+
+def encrypt(
+        input: Union[str, Iterable[bytes]],
+        output_file: Optional[str] = None,
+        cipher: str = "AES-256-GCM",
+        kdf: str = "PBKDF2",
+        hashfunc: str = "SHA3_512",
+        salt: Optional[bytes] = None,
+        iv: Optional[bytes] = None,
+        iterations: int = 100000,
+        buf_size: int = 65536
 ) -> Optional[Iterable[bytes]]:
     if output_file:
         with open(output_file, "wb") as f:
-            for buf in encrypt(input, None, cipher, kdf, hashfunc, salt, iv, iterations):
+            for buf in __encrypt(input, cipher, kdf, hashfunc, salt, iv, iterations, buf_size):
                 f.write(buf)
-        return
+    else:
+        return __encrypt(input, cipher, kdf, hashfunc, salt, iv, iterations, buf_size)
 
-    istream = BufferedReader(input)
 
-    cipher, key_len, mode, kdf, hashfunc = __get_meta(cipher, kdf, hashfunc)
+def __decrypt(
+        input: Union[str, Iterable[bytes]],
+        cipher: str = "AES-256-GCM",
+        kdf: str = "PBKDF2",
+        hashfunc: str = "SHA3_512",
+        iterations: int = 100000,
+        buf_size: int = 65536
+) -> Iterable[bytes]:
+    with BufferedReader(input) as istream:
 
-    if salt is None:
-        salt = __rand_bytes(16)
-    if iv is None:
-        iv = __rand_bytes(cipher["block_size"])
-    key = __make_key(salt, kdf["algorithm"], hashfunc["algorithm"], key_len, iterations)
+        cipher, key_len, mode, kdf, hashfunc = __get_meta(cipher, kdf, hashfunc)
 
-    encryptor = Cipher(
-        cipher["algorithm"](key),
-        mode["algorithm"](iv) if mode else None,
-        backend=__backend
-    ).encryptor()
+        salt_len = int.from_bytes(istream.read(2), byteorder="little")
+        salt = istream.read(salt_len)
+        if len(salt) != salt_len:
+            raise ValueError(
+                f"Expected a salt of length {salt_len} but the file is not long enough. Most likely the file is corrupted or not encrypted using this cipher.")
 
-    yield len(salt).to_bytes(2, byteorder="little")
-    yield salt
-    if mode:
-        yield iv
+        key = __make_key(salt, kdf["algorithm"], hashfunc["algorithm"], key_len, iterations)
 
-    for buf in istream.chunks():
-        yield encryptor.update(buf)
+        if mode:
+            iv = istream.read(cipher["block_size"])
+        else:
+            iv = None
 
-    yield encryptor.finalize()
+        decryptor = Cipher(
+            cipher["algorithm"](key),
+            mode["algorithm"](iv) if mode else None,
+            backend=__backend
+        ).decryptor()
 
-    if mode["auth_tag"]:
-        yield encryptor.tag
+        unpadder = PKCS7(cipher["block_size"] * 8).unpadder()
+
+        buf = None
+        while len(buf2 := istream.read(buf_size)) != 0:
+            if buf:
+                if mode["padded"]:
+                    yield unpadder.update(decryptor.update(buf))
+                else:
+                    yield decryptor.update(buf)
+            buf = buf2
+        if mode["auth_tag"]:
+            try:
+                if mode["padded"]:
+                    yield unpadder.update(decryptor.update(buf[:-mode["auth_tag"]]))
+                    yield unpadder.update(decryptor.finalize_with_tag(buf[-mode["auth_tag"]:]))
+                    yield unpadder.finalize()
+                else:
+                    yield decryptor.update(buf[:-mode["auth_tag"]])
+                    yield decryptor.finalize_with_tag(buf[-mode["auth_tag"]:])
+            except InvalidTag as e:
+                raise ValueError("\nThe authentication token could not be verified. Most likely the data is corrupt or was not encrypted using the given cipher.") from e
+        else:
+            if mode["padded"]:
+                yield unpadder.update(decryptor.update(buf))
+                yield unpadder.update(decryptor.finalize())
+                try:
+                    yield unpadder.finalize()
+                except ValueError as e:
+                    raise ValueError("Could not finalize padding. Most likely the file is corrupt or was not encrypted using the given cipher.") from e
+            else:
+                yield decryptor.update(buf)
+                yield decryptor.finalize()
 
 
 def decrypt(
         input: Union[str, Iterable[bytes]],
-        output_file: Optional[str],
-        cipher: str = "AES-256-CBC",
+        output_file: Optional[str] = None,
+        cipher: str = "AES-256-GCM",
         kdf: str = "PBKDF2",
         hashfunc: str = "SHA3_512",
         salt: Optional[bytes] = None,
         iv: Optional[bytes] = None,
-        iterations: int = 100000
+        iterations: int = 100000,
+        buf_size: int = 65536
 ) -> Optional[Iterable[bytes]]:
     if output_file:
         with open(output_file, "wb") as f:
-            for buf in decrypt(input, None, cipher, kdf, hashfunc, salt, iv, iterations):
+            for buf in __decrypt(input, cipher, kdf, hashfunc, iterations, buf_size):
                 f.write(buf)
-        return
-
-    istream = BufferedReader(input)
-
-    cipher, key_len, mode, kdf, hashfunc = __get_meta(cipher, kdf, hashfunc)
-
-    salt_len = int.from_bytes(istream.read(2), byteorder="little")
-    salt = istream.read(salt_len)
-    if len(salt) != salt_len:
-        print(
-            f"Expected a salt of length {salt_len} but the file is not long enough. Most likely the file is corrupted or not encrypted using this cipher.", file=sys.stderr)
-        exit(1)
-
-    key = __make_key(salt, kdf["algorithm"], hashfunc["algorithm"], key_len, iterations)
-
-    if mode:
-        iv = istream.read(cipher["block_size"])
     else:
-        iv = None
-
-    decryptor = Cipher(
-        cipher["algorithm"](key),
-        mode["algorithm"](iv) if mode else None,
-        backend=__backend
-    ).decryptor()
-
-    buf = None
-    while len(buf2 := istream.read(65536)) != 0:
-        if buf:
-            yield decryptor.update(buf)
-        buf = buf2
-    if mode["auth_tag"]:
-        yield decryptor.update(buf[:-mode["auth_tag"]])
-        try:
-            yield decryptor.finalize_with_tag(buf[-mode["auth_tag"]:])
-        except InvalidTag as e:
-            raise ValueError("\nThe authentication token could not be verified. Most likely the data is corrupt.") from e
-    else:
-        yield decryptor.update(buf)
-        yield decryptor.finalize()
+        return __decrypt(input, cipher, kdf, hashfunc, iterations, buf_size)
 
 
 def main():
@@ -275,7 +342,6 @@ def main():
     parser.add_argument("action",
                         metavar="ACTION",
                         help="'enc' to encrypt, 'dec' to decrypt, 'ciphers' to list ciphers, 'hashes' to list hash functions, 'kdfs' to list kdfs.")
-
     parser.add_argument("-c", "--cipher",
                         dest="cipher",
                         metavar="CIPHER",
@@ -331,18 +397,18 @@ def main():
         exit(1)
 
     if options.action == "ciphers":
-        print("\n".join(__ciphers))
+        print("\n".join(cipher_list()))
         exit(0)
 
     if options.action == "hashes":
-        print("\n".join(__hashtypes))
+        print("\n".join(hash_list()))
         exit(0)
 
     if options.action == "kdfs":
-        print("\n".join(__kdfs))
+        print("\n".join(kdf_list()))
         exit(0)
 
-    params = (options.input, options.output, options.cipher, options.kdf, options.key_hash, bytes(options.salt, "utf-8"), bytes(options.iv, "utf-8"), options.key_iterations)
+    params = (options.input, options.output, options.cipher, options.kdf, options.key_hash, bytes(options.salt, "utf-8") if options.salt else None, bytes(options.initialization_vector, "utf-8") if options.initialization_vector else None, options.key_iterations)
 
     if options.action == "enc":
         encrypt(*params)
